@@ -1,0 +1,275 @@
+"""
+QATM Localization with ROI Tracking - WORKING VERSION
+"""
+
+import cv2
+import numpy as np
+from glob import glob
+from math import atan, degrees
+from datetime import datetime
+from inria_qatm_pytorch_v2_copy import *
+import argparse
+from skimage.draw import line
+from noise import noise, blur
+from cam_sim import SimCamera
+import torchvision
+from time import time, sleep
+from seaborn import color_palette
+
+FPS = 30
+source_image_scale_factor = 1
+video_file = f'inria_video/{datetime.now().strftime("_%d%m%Y_%H%M%S")}.avi'
+select_points = True
+
+def mouse_click(event, x, y, flags, param):
+    global scaled_image, points_array, source_image_scale_factor, line_draw_array, select_points
+    if select_points:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            cv2.circle(scaled_image, (x, y), 5, (0, 0, 255), 4)
+            points_array.append([x * source_image_scale_factor, y * source_image_scale_factor])
+            line_draw_array.append([x, y])
+            if len(points_array) > 1:
+                delta_x, delta_y = line_draw_array[-2][0] - line_draw_array[-1][0], line_draw_array[-2][1] - line_draw_array[-1][1]
+                if delta_x != 0:
+                    ang = degrees(atan(delta_y / delta_x))
+                else:
+                    ang = 90 if delta_y > 0 else -90
+                print(line_draw_array[-2], line_draw_array[-1], ang)
+                cv2.line(scaled_image, tuple(line_draw_array[-2]), tuple(line_draw_array[-1]), (0, 255, 255), 2)
+            cv2.imshow("point_selector", scaled_image)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='QATM Localization with ROI Tracking')
+    parser.add_argument('--cuda', action='store_true', default=False)
+    parser.add_argument('--resize', '-r', type=int, default=100)
+    parser.add_argument('--crop_size', '-cs', type=int, default=150)
+    parser.add_argument('--alpha', '-a', type=float, default=25)
+    parser.add_argument('--fps', '-f', type=int, default=5)
+    parser.add_argument('--scale_factor', '-sf', type=int, default=1)
+    parser.add_argument('--thres', '-t', type=float, default=0.85, help="threshold for QATM matching")
+    parser.add_argument('--source', '-s', type=str, required=True)
+    parser.add_argument('--noise', '-n', type=str, default='none',
+                        help="Noise type {gauss_n, gauss_u, sp, poisson, random, none}")
+    parser.add_argument('--blur', '-b', type=str, default='none',
+                        help="blur type = {normal, median, gauss, bilateral, none}")
+    parser.add_argument('--blur_filter', '-bf', type=int, default=5,
+                        help="blur filter size, must be odd number")
+    parser.add_argument('--local', '-l', action='store_true', default=True,
+                        help="Use localization to search only around previous match")
+    parser.add_argument('--local_size', '-ls', type=int, default=500, help="Localization window size in pixels")
+
+    args = parser.parse_args()
+    print(args)
+    
+    width, height = args.crop_size, args.crop_size
+    np.random.seed(123)
+    source_image_scale_factor = args.scale_factor
+
+    points_array = []
+    line_draw_array = []
+    template_resolution = (width, height)
+
+    # Load source image
+    source_image = cv2.imread(args.source)
+    if source_image is None:
+        print(f"ERROR: Cannot load image {args.source}")
+        exit(1)
+    
+    src_h, src_w = source_image.shape[:2]
+    print(f"Source image: {src_w}×{src_h} pixels")
+
+    scaled_image = cv2.resize(source_image, (src_w // source_image_scale_factor, src_h // source_image_scale_factor))
+
+    # Select waypoints
+    cv2.imshow("point_selector", scaled_image)
+    cv2.setMouseCallback('point_selector', mouse_click)
+    print("Select waypoints, press any key when done...")
+    cv2.waitKey()
+    select_points = False
+    cv2.destroyWindow("point_selector")
+
+    if len(points_array) < 2:
+        print("ERROR: Need at least 2 waypoints")
+        exit(1)
+
+    print(f"Selected {len(points_array)} waypoints:", points_array)
+
+    # Load VGG-19
+    model = torchvision.models.vgg19(pretrained=True)
+    try:
+        model.load_state_dict(torch.load("./vgg19.pth"))
+        print("Loaded VGG-19 weights")
+    except:
+        print("Downloading VGG-19 weights...")
+        model = torchvision.models.vgg19(pretrained=True)
+        torch.save(model.state_dict(), "./vgg19.pth")
+    model = model.eval()
+
+    # Initialize data loader
+    data_loader = ImageData(source_img=args.source, half=False, thres=args.thres)
+
+    color_list = color_palette("hls", 1)
+    color_list = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), color_list))
+
+    color = 0
+    d_img = data_loader.image_raw.copy()
+    new_size = (int(width * args.resize / 100.0), int(height * args.resize / 100.0))
+
+    # Initialize QATM model
+    print("Initializing QATM model...")
+    model_qatm = CreateModel_2(model=model.features, alpha=args.alpha, use_cuda=args.cuda, image=data_loader.image)
+    print("QATM initialized")
+
+    # Start camera
+    camera_fps = args.fps
+    camera = SimCamera(points_array=points_array, image=args.source, fps=camera_fps, skip_pts=3)
+    camera.start()
+    print(f"Camera started at {camera_fps} FPS")
+
+    tic = time()
+    prev_match_center = None  # for localization
+    frame_count = 0
+    success_count = 0
+    total_error = 0
+
+    print("\nProcessing frames (press 'q' to quit)...")
+    print("="*70)
+
+    while True:
+        if camera.frame_q.empty():
+            if not camera.running.empty() and camera.process.is_alive():
+                sleep(1/camera_fps)
+                continue
+            else:
+                print("\nCamera finished")
+                break
+        
+        fid, frame_x, frame_y, crop = camera.frame_q.get()
+        frame_count += 1
+        print(f"\nFrame {fid} | GT: ({frame_x},{frame_y})")
+        
+        # Apply noise and blur
+        crop = noise(crop, args.noise)
+        crop = blur(crop, args.blur, (args.blur_filter, args.blur_filter))
+
+        if args.resize != 100:
+            crop = cv2.resize(crop, new_size)
+
+        data = data_loader.load_template(crop)
+
+        # Localization logic
+        x1, y1 = 0, 0  # offset for localization
+        
+        if args.local and prev_match_center is not None:
+            # ROI SEARCH
+            center_x, center_y = prev_match_center
+            half_size = args.local_size // 2
+            
+            x1 = max(center_x - half_size, 0)
+            y1 = max(center_y - half_size, 0)
+            x2 = min(center_x + half_size, src_w)
+            y2 = min(center_y + half_size, src_h)
+            
+            print(f"  ROI search: ({x1},{y1})-({x2},{y2})")
+            
+            search_region = data_loader.image_raw[y1:y2, x1:x2]
+            
+            # Create temporary loader for ROI
+            temp_tensor = data_loader.transform(search_region).unsqueeze(0)
+            if args.cuda:
+                temp_tensor = temp_tensor.cuda()
+            
+            # Create model for ROI
+            roi_model = CreateModel_2(model=model.features, alpha=args.alpha, use_cuda=args.cuda, image=temp_tensor)
+            score = run_one_sample_2(roi_model, template=data['template'], image=temp_tensor)
+        else:
+            # FULL SEARCH
+            print(f"  Full image search")
+            score = run_one_sample_2(model_qatm, template=data['template'], image=data['image'])
+
+        # NMS
+        scores = np.squeeze(np.array([score]), axis=1)
+        w_array = np.array([data['template_w']])
+        h_array = np.array([data['template_h']])
+        thresh_list = [args.thres]
+
+        try:
+            mb_boxes, mb_indices = nms_multi(scores, w_array, h_array, thresh_list, multibox=False)
+        except Exception as e:
+            print(f"  ⚠ NMS error: {e}, using higher threshold")
+            thresh_list = [0.90]
+            mb_boxes, mb_indices = nms_multi(scores, w_array, h_array, thresh_list, multibox=False)
+
+        # Process detections
+        if len(mb_indices) > 0:
+            # Get best box
+            best_box = mb_boxes[0]  # Shape: [[x1,y1],[x2,y2]]
+            
+            # Calculate center
+            center_x = int((best_box[0][0] + best_box[1][0]) / 2)
+            center_y = int((best_box[0][1] + best_box[1][1]) / 2)
+            
+            # Adjust for localization offset
+            if args.local and prev_match_center is not None:
+                center_x += x1
+                center_y += y1
+
+            prev_match_center = (center_x, center_y)
+            
+            # Calculate error
+            error = np.sqrt((center_x - frame_x)**2 + (center_y - frame_y)**2)
+            total_error += error
+            success_count += 1
+            
+            print(f"  ✓ Detected: ({center_x},{center_y})")
+            print(f"    Error: {error:.1f} pixels")
+
+            # Adjust boxes for display
+            if args.local and x1 > 0:
+                mb_boxes_display = mb_boxes.copy()
+                mb_boxes_display[:, :, 0] += x1
+                mb_boxes_display[:, :, 1] += y1
+                d_img = plot_result(scaled_image, mb_boxes_display, text=f"{fid}")
+            else:
+                d_img = plot_result(scaled_image, mb_boxes, text=f"{fid}")
+
+            scaled_image = d_img
+        else:
+            # No detection
+            prev_match_center = None
+            print(f"  ✗ No detection (reset localization)")
+            d_img = scaled_image.copy()
+
+        # Visualization
+        vis_img = d_img.copy()
+        
+        # Draw ground truth
+        cv2.circle(vis_img, (frame_x, frame_y), 7, (0, 0, 255), 2)
+        cv2.putText(vis_img, "GT", (frame_x+10, frame_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        
+        cv2.imshow("result", cv2.resize(vis_img, (vis_img.shape[1] // source_image_scale_factor,
+                                                   vis_img.shape[0] // source_image_scale_factor)))
+        cv2.imshow("v-camera", crop)
+
+        k = cv2.waitKey(1)
+        if k == ord('q'):
+            print("\nUser quit")
+            break
+        
+        toc = time()
+        print(f"  Time: {(toc - tic)*1000:.0f}ms")
+        tic = toc
+
+    # Cleanup
+    camera.stop = True
+    cv2.destroyAllWindows()
+    
+    # Statistics
+    print("\n" + "="*70)
+    print("STATISTICS")
+    print("="*70)
+    print(f"Frames processed:      {frame_count}")
+    print(f"Successful detections: {success_count}/{frame_count} ({success_count/max(1,frame_count)*100:.1f}%)")
+    if success_count > 0:
+        print(f"Average error:         {total_error/success_count:.1f} pixels")
+    print("="*70)
